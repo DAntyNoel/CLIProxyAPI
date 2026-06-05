@@ -166,6 +166,12 @@ func (e *CodexExecutor) executeOpenAIImage(ctx context.Context, auth *cliproxyau
 		}
 	}
 
+	if out, ok, errOutput := codexBuildImagesAPIResponseFromOutputItems(outputItemsByIndex, outputItemsFallback, prepared.ResponseFormat); errOutput != nil {
+		return resp, errOutput
+	} else if ok {
+		return cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}, nil
+	}
+
 	err = statusErr{code: http.StatusGatewayTimeout, msg: "stream error: stream disconnected before completion"}
 	return resp, err
 }
@@ -298,6 +304,19 @@ func (e *CodexExecutor) executeOpenAIImageStream(ctx context.Context, auth *clip
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
 			sendError(errScan)
+			return
+		}
+
+		if results, usageRaw, ok, errExtract := codexExtractImageResultsFromOutputItems(outputItemsByIndex, outputItemsFallback); errExtract != nil {
+			sendError(errExtract)
+			return
+		} else if ok {
+			for _, img := range results {
+				frame := codexBuildImageCompletedFrame(img, usageRaw, prepared.ResponseFormat, prepared.StreamPrefix)
+				if len(frame) > 0 && !sendPayload(frame) {
+					return
+				}
+			}
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
@@ -576,6 +595,45 @@ func codexMultipartFileToDataURL(fileHeader *multipart.FileHeader) (string, erro
 		mediaType = http.DetectContentType(data)
 	}
 	return "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data), nil
+}
+
+func codexOutputItemsCompletedEvent(outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
+	if len(outputItemsByIndex) == 0 && len(outputItemsFallback) == 0 {
+		return nil
+	}
+	completed := []byte(`{"type":"response.completed","response":{"output":[]}}`)
+	return patchCodexCompletedOutput(completed, outputItemsByIndex, outputItemsFallback)
+}
+
+func codexExtractImageResultsFromOutputItems(outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) (results []codexImageCallResult, usageRaw []byte, ok bool, err error) {
+	completed := codexOutputItemsCompletedEvent(outputItemsByIndex, outputItemsFallback)
+	if len(completed) == 0 {
+		return nil, nil, false, nil
+	}
+	results, _, usageRaw, _, err = codexExtractImagesFromResponsesCompleted(completed)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return results, usageRaw, len(results) > 0, nil
+}
+
+func codexBuildImagesAPIResponseFromOutputItems(outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte, responseFormat string) ([]byte, bool, error) {
+	completed := codexOutputItemsCompletedEvent(outputItemsByIndex, outputItemsFallback)
+	if len(completed) == 0 {
+		return nil, false, nil
+	}
+	results, createdAt, usageRaw, firstMeta, err := codexExtractImagesFromResponsesCompleted(completed)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(results) == 0 {
+		return nil, false, nil
+	}
+	out, err := codexBuildImagesAPIResponse(results, createdAt, usageRaw, firstMeta, responseFormat)
+	if err != nil {
+		return nil, false, err
+	}
+	return out, true, nil
 }
 
 func codexExtractImagesFromResponsesCompleted(payload []byte) (results []codexImageCallResult, createdAt int64, usageRaw []byte, firstMeta codexImageCallResult, err error) {
