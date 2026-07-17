@@ -1,8 +1,8 @@
-// Package gemini provides request translation functionality for Gemini CLI to Gemini API compatibility.
-// It handles parsing and transforming Gemini CLI API requests into Gemini API format,
+// Package gemini provides request translation functionality for Antigravity to Gemini API compatibility.
+// It handles parsing and transforming Antigravity API requests into Gemini API format,
 // extracting model information, system instructions, message contents, and tool declarations.
 // The package performs JSON data transformation to ensure compatibility
-// between Gemini CLI API format and Gemini API's expected format.
+// between Antigravity API format and Gemini API's expected format.
 package gemini
 
 import (
@@ -18,7 +18,7 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-// ConvertGeminiRequestToAntigravity parses and transforms a Gemini CLI API request into Gemini API format.
+// ConvertGeminiRequestToAntigravity parses and transforms a Antigravity API request into Gemini API format.
 // It extracts the model name, system instruction, message contents, and tool declarations
 // from the raw JSON request and returns them in the format expected by the Gemini API.
 // The function performs the following transformations:
@@ -29,13 +29,14 @@ import (
 //
 // Parameters:
 //   - modelName: The name of the model to use for the request (unused in current implementation)
-//   - rawJSON: The raw JSON request data from the Gemini CLI API
+//   - rawJSON: The raw JSON request data from the Antigravity API
 //   - stream: A boolean indicating if the request is for a streaming response (unused in current implementation)
 //
 // Returns:
 //   - []byte: The transformed request data in Gemini API format
 func ConvertGeminiRequestToAntigravity(modelName string, inputRawJSON []byte, _ bool) []byte {
 	rawJSON := inputRawJSON
+	functionNameMap := util.SanitizedFunctionNameMap(inputRawJSON)
 	template := `{"project":"","request":{},"model":""}`
 	templateBytes, _ := sjson.SetRawBytes([]byte(template), "request", rawJSON)
 	templateBytes, _ = sjson.SetBytes(templateBytes, "model", modelName)
@@ -83,22 +84,46 @@ func ConvertGeminiRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	}
 
 	toolsResult := gjson.GetBytes(rawJSON, "request.tools")
-	if toolsResult.Exists() && toolsResult.IsArray() {
-		toolResults := toolsResult.Array()
-		for i := 0; i < len(toolResults); i++ {
-			functionDeclarationsResult := gjson.GetBytes(rawJSON, fmt.Sprintf("request.tools.%d.function_declarations", i))
-			if functionDeclarationsResult.Exists() && functionDeclarationsResult.IsArray() {
-				functionDeclarationsResults := functionDeclarationsResult.Array()
-				for j := 0; j < len(functionDeclarationsResults); j++ {
-					parametersResult := gjson.GetBytes(rawJSON, fmt.Sprintf("request.tools.%d.function_declarations.%d.parameters", i, j))
-					if parametersResult.Exists() {
-						strJson, _ := util.RenameKey(string(rawJSON), fmt.Sprintf("request.tools.%d.function_declarations.%d.parameters", i, j), fmt.Sprintf("request.tools.%d.function_declarations.%d.parametersJsonSchema", i, j))
-						rawJSON = []byte(strJson)
+	if toolsResult.IsArray() {
+		seenFunctionNames := make(map[string]struct{})
+		for toolIndex := range toolsResult.Array() {
+			for _, key := range []string{"functionDeclarations", "function_declarations"} {
+				path := fmt.Sprintf("request.tools.%d.%s", toolIndex, key)
+				declarations := gjson.GetBytes(rawJSON, path)
+				if !declarations.IsArray() {
+					continue
+				}
+
+				parts := make([]string, 0, len(declarations.Array()))
+				for _, declaration := range declarations.Array() {
+					name := declaration.Get("name").String()
+					mappedName := util.MapSanitizedFunctionName(functionNameMap, name)
+					if mappedName != "" {
+						if _, exists := seenFunctionNames[mappedName]; exists {
+							continue
+						}
+						seenFunctionNames[mappedName] = struct{}{}
 					}
+
+					declarationJSON := []byte(declaration.Raw)
+					declarationJSON, _ = sjson.SetBytes(declarationJSON, "name", mappedName)
+					if parameters := declaration.Get("parameters"); parameters.Exists() {
+						declarationJSON, _ = sjson.SetRawBytes(declarationJSON, "parametersJsonSchema", []byte(parameters.Raw))
+						declarationJSON, _ = sjson.DeleteBytes(declarationJSON, "parameters")
+					}
+					parts = append(parts, string(declarationJSON))
+				}
+				deduplicated := []byte("[" + strings.Join(parts, ",") + "]")
+				var errSet error
+				rawJSON, errSet = sjson.SetRawBytes(rawJSON, path, deduplicated)
+				if errSet != nil {
+					log.Warnf("failed to normalize function declarations in tool %d: %v", toolIndex, errSet)
 				}
 			}
 		}
+		rawJSON = removeEmptyGeminiFunctionTools(rawJSON)
 	}
+	rawJSON = rewriteGeminiFunctionNames(rawJSON, functionNameMap)
 
 	if strings.Contains(strings.ToLower(modelName), "claude") {
 		rawJSON = sanitizeAntigravityClaudeGeminiRequestSignatures(modelName, rawJSON)
@@ -107,6 +132,58 @@ func ConvertGeminiRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	}
 
 	return common.AttachDefaultSafetySettings(rawJSON, "request.safetySettings")
+}
+
+func removeEmptyGeminiFunctionTools(rawJSON []byte) []byte {
+	tools := gjson.GetBytes(rawJSON, "request.tools")
+	cleanedTools := []byte(`[]`)
+	for _, tool := range tools.Array() {
+		toolJSON := []byte(tool.Raw)
+		if tool.IsObject() {
+			for _, key := range []string{"functionDeclarations", "function_declarations"} {
+				if declarations := tool.Get(key); declarations.IsArray() && len(declarations.Array()) == 0 {
+					toolJSON, _ = sjson.DeleteBytes(toolJSON, key)
+				}
+			}
+			if len(gjson.ParseBytes(toolJSON).Map()) == 0 {
+				continue
+			}
+		}
+		cleanedTools, _ = sjson.SetRawBytes(cleanedTools, "-1", toolJSON)
+	}
+	if len(gjson.ParseBytes(cleanedTools).Array()) == 0 {
+		rawJSON, _ = sjson.DeleteBytes(rawJSON, "request.tools")
+		return rawJSON
+	}
+	rawJSON, _ = sjson.SetRawBytes(rawJSON, "request.tools", cleanedTools)
+	return rawJSON
+}
+
+func rewriteGeminiFunctionNames(rawJSON []byte, functionNameMap map[string]string) []byte {
+	contents := gjson.GetBytes(rawJSON, "request.contents")
+	for contentIndex, content := range contents.Array() {
+		for partIndex, part := range content.Get("parts").Array() {
+			for _, field := range []string{"functionCall", "functionResponse", "function_call", "function_response"} {
+				name := part.Get(field + ".name").String()
+				if name == "" {
+					continue
+				}
+				path := fmt.Sprintf("request.contents.%d.parts.%d.%s.name", contentIndex, partIndex, field)
+				rawJSON, _ = sjson.SetBytes(rawJSON, path, util.MapSanitizedFunctionName(functionNameMap, name))
+			}
+		}
+	}
+	for _, allowedPath := range []string{
+		"request.toolConfig.functionCallingConfig.allowedFunctionNames",
+		"request.tool_config.function_calling_config.allowed_function_names",
+	} {
+		allowedNames := gjson.GetBytes(rawJSON, allowedPath)
+		for index, name := range allowedNames.Array() {
+			path := fmt.Sprintf("%s.%d", allowedPath, index)
+			rawJSON, _ = sjson.SetBytes(rawJSON, path, util.MapSanitizedFunctionName(functionNameMap, name.String()))
+		}
+	}
+	return rawJSON
 }
 
 func sanitizeAntigravityClaudeGeminiRequestSignatures(modelName string, rawJSON []byte) []byte {

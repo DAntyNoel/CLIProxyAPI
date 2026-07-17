@@ -13,11 +13,15 @@ type codexClientModelsPayload struct {
 	Models []map[string]any `json:"models"`
 }
 
+type codexClientModelProvidersFunc func(string) []string
+
 var (
-	codexClientModelTemplatesOnce sync.Once
-	codexClientModelTemplates     map[string]map[string]any
-	codexClientDefaultTemplate    map[string]any
-	codexClientModelTemplatesErr  error
+	codexClientModelTemplatesMu       sync.Mutex
+	codexClientModelTemplatesLoaded   bool
+	codexClientModelTemplatesRevision uint64
+	codexClientModelTemplates         map[string]map[string]any
+	codexClientDefaultTemplate        map[string]any
+	codexClientModelTemplatesErr      error
 )
 
 var codexClientAllowedReasoningLevels = map[string]struct{}{
@@ -26,19 +30,25 @@ var codexClientAllowedReasoningLevels = map[string]struct{}{
 	"medium": {},
 	"high":   {},
 	"xhigh":  {},
+	"max":    {},
+	"ultra":  {},
 }
 
 func (h *OpenAIAPIHandler) codexClientModelsResponse() map[string]any {
-	return CodexClientModelsResponse(h.Models())
+	return codexClientModelsResponse(h.Models(), registry.GetGlobalRegistry().GetModelProviders)
 }
 
 func CodexClientModelsResponse(models []map[string]any) map[string]any {
+	return codexClientModelsResponse(models, nil)
+}
+
+func codexClientModelsResponse(models []map[string]any, providersForModel codexClientModelProvidersFunc) map[string]any {
 	return map[string]any{
-		"models": buildCodexClientModels(models),
+		"models": buildCodexClientModels(models, providersForModel),
 	}
 }
 
-func buildCodexClientModels(models []map[string]any) []map[string]any {
+func buildCodexClientModels(models []map[string]any, providersForModel codexClientModelProvidersFunc) []map[string]any {
 	templates, defaultTemplate, err := loadCodexClientModelTemplates()
 	if err != nil || defaultTemplate == nil {
 		return nil
@@ -53,6 +63,8 @@ func buildCodexClientModels(models []map[string]any) []map[string]any {
 
 		if template, ok := templates[id]; ok {
 			entry := cloneCodexClientModelMap(template)
+			applyCodexClientDisplayName(entry, model)
+			applyCodexClientSearchToolSupport(entry, id, true, providersForModel)
 			sanitizeCodexClientReasoningMetadata(entry)
 			applyCodexClientVisibilityOverride(entry, id)
 			result = append(result, entry)
@@ -61,10 +73,13 @@ func buildCodexClientModels(models []map[string]any) []map[string]any {
 
 		entry := cloneCodexClientModelMap(defaultTemplate)
 		applyCodexClientModelMetadata(entry, id, model)
+		applyCodexClientSearchToolSupport(entry, id, false, providersForModel)
 		sanitizeCodexClientReasoningMetadata(entry)
 		applyCodexClientVisibilityOverride(entry, id)
 		result = append(result, entry)
 	}
+
+	applyCodexClientNonTemplatePriorities(result, templates)
 
 	sort.SliceStable(result, func(i, j int) bool {
 		return codexClientModelPriority(result[i]) < codexClientModelPriority(result[j])
@@ -73,28 +88,130 @@ func buildCodexClientModels(models []map[string]any) []map[string]any {
 	return result
 }
 
-func loadCodexClientModelTemplates() (map[string]map[string]any, map[string]any, error) {
-	codexClientModelTemplatesOnce.Do(func() {
-		var payload codexClientModelsPayload
-		codexClientModelTemplatesErr = json.Unmarshal(registry.GetCodexClientModelsJSON(), &payload)
-		if codexClientModelTemplatesErr != nil {
-			return
+func maxCodexClientTemplatePriority(templates map[string]map[string]any) int {
+	maxPriority := 0
+	for _, template := range templates {
+		priority := codexClientModelPriority(template)
+		if priority > maxPriority {
+			maxPriority = priority
 		}
+	}
+	return maxPriority
+}
 
-		codexClientModelTemplates = make(map[string]map[string]any, len(payload.Models))
+func applyCodexClientNonTemplatePriorities(result []map[string]any, templates map[string]map[string]any) {
+	if len(result) == 0 {
+		return
+	}
+
+	basePriority := maxCodexClientTemplatePriority(templates)
+	type nonTemplateEntry struct {
+		index       int
+		displayName string
+		slug        string
+	}
+
+	pending := make([]nonTemplateEntry, 0)
+	for index, entry := range result {
+		slug := stringModelValue(entry, "slug")
+		if _, ok := templates[slug]; ok {
+			continue
+		}
+		displayName := stringModelValue(entry, "display_name")
+		if displayName == "" {
+			displayName = slug
+		}
+		pending = append(pending, nonTemplateEntry{
+			index:       index,
+			displayName: displayName,
+			slug:        slug,
+		})
+	}
+
+	sort.SliceStable(pending, func(i, j int) bool {
+		left := strings.ToLower(pending[i].displayName)
+		right := strings.ToLower(pending[j].displayName)
+		if left == right {
+			return pending[i].slug < pending[j].slug
+		}
+		return left < right
+	})
+
+	for rank, entry := range pending {
+		result[entry.index]["priority"] = basePriority + 100*(rank+1)
+	}
+}
+
+func loadCodexClientModelTemplates() (map[string]map[string]any, map[string]any, error) {
+	raw, revision := registry.GetCodexClientModelsSnapshot()
+	return loadCodexClientModelTemplatesSnapshot(raw, revision)
+}
+
+func loadCodexClientModelTemplatesSnapshot(raw []byte, revision uint64) (map[string]map[string]any, map[string]any, error) {
+	codexClientModelTemplatesMu.Lock()
+	defer codexClientModelTemplatesMu.Unlock()
+	if codexClientModelTemplatesLoaded && codexClientModelTemplatesRevision == revision {
+		return codexClientModelTemplates, codexClientDefaultTemplate, codexClientModelTemplatesErr
+	}
+
+	var payload codexClientModelsPayload
+	err := json.Unmarshal(raw, &payload)
+	var templates map[string]map[string]any
+	var defaultTemplate map[string]any
+	if err == nil {
+		templates = make(map[string]map[string]any, len(payload.Models))
 		for _, model := range payload.Models {
 			slug := strings.TrimSpace(stringModelValue(model, "slug"))
 			if slug == "" {
 				continue
 			}
-			codexClientModelTemplates[slug] = cloneCodexClientModelMap(model)
+			templates[slug] = cloneCodexClientModelMap(model)
 			if slug == "gpt-5.5" {
-				codexClientDefaultTemplate = cloneCodexClientModelMap(model)
+				defaultTemplate = cloneCodexClientModelMap(model)
 			}
 		}
-	})
+	}
 
+	codexClientModelTemplatesLoaded = true
+	codexClientModelTemplatesRevision = revision
+	codexClientModelTemplates = templates
+	codexClientDefaultTemplate = defaultTemplate
+	codexClientModelTemplatesErr = err
 	return codexClientModelTemplates, codexClientDefaultTemplate, codexClientModelTemplatesErr
+}
+
+func applyCodexClientDisplayName(entry map[string]any, model map[string]any) {
+	if displayName := stringModelValue(model, "display_name"); displayName != "" {
+		entry["display_name"] = displayName
+	}
+}
+
+func applyCodexClientSearchToolSupport(entry map[string]any, id string, templateModel bool, providersForModel codexClientModelProvidersFunc) {
+	supportsSearch, _ := entry["supports_search_tool"].(bool)
+	if !supportsSearch {
+		return
+	}
+
+	if !templateModel {
+		entry["supports_search_tool"] = false
+		return
+	}
+
+	if providersForModel == nil {
+		return
+	}
+
+	providers := providersForModel(id)
+	if len(providers) == 0 {
+		entry["supports_search_tool"] = false
+		return
+	}
+	for _, provider := range providers {
+		if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+			entry["supports_search_tool"] = false
+			return
+		}
+	}
 }
 
 func applyCodexClientModelMetadata(entry map[string]any, id string, model map[string]any) {
@@ -116,6 +233,10 @@ func applyCodexClientModelMetadata(entry map[string]any, id string, model map[st
 		}
 		if info.Type == registry.OpenAIImageModelType {
 			entry["visibility"] = "hide"
+			delete(entry, "input_modalities")
+			delete(entry, "supports_image_detail_original")
+		} else {
+			applyCodexClientInputModalitiesMetadata(entry, info.SupportedInputModalities)
 		}
 		applyCodexClientThinkingMetadata(entry, info.Thinking)
 	}
@@ -130,8 +251,8 @@ func applyCodexClientModelMetadata(entry map[string]any, id string, model map[st
 	entry["slug"] = id
 	entry["display_name"] = displayName
 	entry["description"] = description
-	entry["priority"] = 100
 	entry["prefer_websockets"] = false
+	entry["service_tiers"] = []any{}
 	delete(entry, "apply_patch_tool_type")
 	delete(entry, "upgrade")
 	delete(entry, "availability_nux")
@@ -151,8 +272,40 @@ func applyCodexClientModelMetadata(entry map[string]any, id string, model map[st
 
 func applyCodexClientVisibilityOverride(entry map[string]any, id string) {
 	switch strings.TrimSpace(id) {
-	case "grok-imagine-image-quality", "gpt-image-2", "grok-imagine-image", "grok-imagine-video", "grok-imagine-video-1.5-preview":
+	case "grok-imagine-image-quality", "gpt-image-1.5", "gpt-image-2", "grok-imagine-image", "grok-imagine-video", "grok-imagine-video-1.5-preview":
 		entry["visibility"] = "hide"
+	}
+}
+
+func applyCodexClientInputModalitiesMetadata(entry map[string]any, modalities []string) {
+	if len(modalities) == 0 {
+		return
+	}
+	// Codex client only accepts text/image input modalities.
+	codexModalities := make([]any, 0, 2)
+	seen := make(map[string]struct{}, 2)
+	supportsImage := false
+	for _, raw := range modalities {
+		switch modality := strings.ToLower(strings.TrimSpace(raw)); modality {
+		case "text", "image":
+			if _, ok := seen[modality]; ok {
+				continue
+			}
+			seen[modality] = struct{}{}
+			codexModalities = append(codexModalities, modality)
+			if modality == "image" {
+				supportsImage = true
+			}
+		}
+	}
+	if len(codexModalities) == 0 {
+		return
+	}
+	entry["input_modalities"] = codexModalities
+	if supportsImage {
+		entry["supports_image_detail_original"] = true
+	} else {
+		delete(entry, "supports_image_detail_original")
 	}
 }
 
@@ -249,6 +402,8 @@ func codexClientReasoningDescription(level string) string {
 		return "Greater reasoning depth for complex problems"
 	case "xhigh":
 		return "Extra high reasoning depth for complex problems"
+	case "max":
+		return "Maximum available reasoning depth for complex problems"
 	default:
 		return level
 	}
