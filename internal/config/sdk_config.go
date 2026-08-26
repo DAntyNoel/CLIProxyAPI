@@ -45,6 +45,9 @@ type SDKConfig struct {
 	// CodexOptimizeMultiAgentV2 mirrors the provider-wide runtime setting for API handlers.
 	CodexOptimizeMultiAgentV2 bool `yaml:"-" json:"-"`
 
+	// CodexRepeatedToolLoopThreshold mirrors the provider-wide recovery threshold for API handlers.
+	CodexRepeatedToolLoopThreshold int `yaml:"-" json:"-"`
+
 	// ClaudeCode configures Claude Code compatibility behavior.
 	ClaudeCode ClaudeCodeConfig `yaml:"claude-code" json:"claude-code"`
 

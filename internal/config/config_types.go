@@ -158,6 +158,10 @@ type CodexConfig struct {
 	StreamBootstrapBuffering bool `yaml:"stream-bootstrap-buffering" json:"stream-bootstrap-buffering"`
 	// OptimizeMultiAgentV2 optimizes official Codex multi-agent requests.
 	OptimizeMultiAgentV2 bool `yaml:"optimize-multi-agent-v2" json:"optimize-multi-agent-v2"`
+	// RepeatedToolLoopThreshold enables recovery when an automatic official Codex
+	// Responses request ends with this many identical successful tool call/result
+	// pairs. Zero disables the protection.
+	RepeatedToolLoopThreshold int `yaml:"repeated-tool-loop-threshold" json:"repeated-tool-loop-threshold"`
 	// LiveMediaRelay terminates and relays Codex Live WebRTC media in this process.
 	LiveMediaRelay CodexLiveMediaRelayConfig `yaml:"live-media-relay" json:"live-media-relay"`
 }

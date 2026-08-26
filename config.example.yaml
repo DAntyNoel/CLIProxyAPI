@@ -255,6 +255,10 @@ codex:
   # normalizes encrypted agent_message content for Codex, and converts agent_message input
   # into standard user messages for non-Codex upstream protocols.
   optimize-multi-agent-v2: false
+  # Recover from automatic official Codex Responses requests that end with this many
+  # identical successful tool call/result pairs by steering the next selection away
+  # from the repeated tool. Set to 0 to disable the protection.
+  repeated-tool-loop-threshold: 0
   # Terminate and relay Codex Live WebRTC audio and DataChannel traffic in this process.
   # This requires inbound UDP reachability. Keep disabled to preserve direct media behavior.
   live-media-relay:

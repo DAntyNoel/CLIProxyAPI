@@ -96,6 +96,14 @@ func TestBuildConfigChangeDetails_NoChanges(t *testing.T) {
 	}
 }
 
+func TestBuildConfigChangeDetails_CodexRepeatedToolLoopThreshold(t *testing.T) {
+	oldCfg := &config.Config{Codex: config.CodexConfig{RepeatedToolLoopThreshold: 0}}
+	newCfg := &config.Config{Codex: config.CodexConfig{RepeatedToolLoopThreshold: 3}}
+
+	details := BuildConfigChangeDetails(oldCfg, newCfg)
+	expectContains(t, details, "codex.repeated-tool-loop-threshold: 0 -> 3")
+}
+
 func TestBuildConfigChangeDetails_CodexLiveMediaRelay(t *testing.T) {
 	oldCfg := &config.Config{Codex: config.CodexConfig{LiveMediaRelay: config.CodexLiveMediaRelayConfig{
 		Enabled:     false,

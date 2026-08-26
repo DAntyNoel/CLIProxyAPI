@@ -87,6 +87,9 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
 	}
+	if cfg.Codex.RepeatedToolLoopThreshold < 0 {
+		cfg.Codex.RepeatedToolLoopThreshold = 0
+	}
 
 	cfg.NormalizePluginsConfig()
 	if errResolvePluginsDir := cfg.ResolvePluginsDir(); errResolvePluginsDir != nil && cfg.Plugins.Enabled {

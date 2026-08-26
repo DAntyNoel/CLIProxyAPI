@@ -550,6 +550,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		} else {
 			requestJSON, toolCacheTurn = prepareResponsesWebsocketFallbackTurn(downstreamSessionKey, requestJSON)
 			nextLastRequest = requestJSON
+			// Apply the guard only to this execution copy. nextLastRequest keeps the
+			// complete tool set so a one-turn recovery never mutates WS session state.
+			requestJSON = h.applyCodexResponsesLiteToolLoopGuard(c, requestJSON)
 		}
 
 		modelName := gjson.GetBytes(requestJSON, "model").String()
