@@ -281,7 +281,16 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	requestLogEnabled := h != nil && h.Cfg != nil && h.Cfg.RequestLog
 	wsTimelineLog := newWebsocketTimelineLog(requestLogEnabled, websocketTimelineSourceFromContext(c))
 	localInterrupt := newResponsesLocalInterrupt()
+	// A completed downstream turn may outlive its upstream execution session.
+	// Ignore an interrupt for that exact terminal response on this socket.
+	var terminalResponseID atomic.Pointer[string]
 	input, inputDone := readResponsesWebsocketInput(socketCtx, cancelSocket, conn, func(payload []byte) error {
+		responseID := gjson.GetBytes(payload, "response_id")
+		if responseID.Type == gjson.String {
+			if terminal := terminalResponseID.Load(); terminal != nil && *terminal == responseID.String() {
+				return nil
+			}
+		}
 		return h.forwardResponsesWebsocketInterrupt(socketCtx, passthroughSessionID, payload)
 	}, localInterrupt, writer, wsTimelineLog)
 	var duplexInput <-chan cliproxyexecutor.WebsocketInput
@@ -767,6 +776,11 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				localInterrupt:           localInterrupt,
 			},
 		)
+		if errForward == nil && forwardErrMsg == nil {
+			if responseID := strings.TrimSpace(completedResponseID); responseID != "" {
+				terminalResponseID.Store(&responseID)
+			}
+		}
 		if errForward != nil {
 			wsTerminateErr = errForward
 			switch {
